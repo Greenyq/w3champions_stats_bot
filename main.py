@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from flask import Flask
 from playwright.sync_api import sync_playwright
 import urllib.parse
+from datetime import date, datetime
 
 # === LOAD .env ===
 load_dotenv()
@@ -20,6 +21,9 @@ MATCHES_TO_ANALYZE = 10
 MATCHES_FROM_SITE = 5
 
 app = Flask(__name__)
+
+# === GLOBALS ===
+last_posted_date = None
 
 # === FUNCTIONS ===
 
@@ -190,11 +194,17 @@ def home():
 
 @app.route('/run')
 def run():
+    global last_posted_date
+    today = date.today()
+
+    print(f"=== BOT STARTED AT {datetime.now()} ===")
+
+    if last_posted_date == today:
+        print("⏱ Already sent today.")
+        return '⏱ Already sent today', 200
+
     try:
         players = load_players("players.txt")
-
-        from datetime import date
-        today = date.today().strftime("%Y-%m-%d")
 
         full_message = f"🏆 <b>W3Champions Статистика игроков</b>\n📅 Сегодня: {today}\n\n"
 
@@ -214,9 +224,10 @@ def run():
 
             time.sleep(2)
 
-        # Отправляем общий пост
         safe_send_to_telegram(full_message)
 
+        last_posted_date = today
+        print("✅ Telegram post complete.")
         return "✅ Bot run success", 200
 
     except Exception as e:
