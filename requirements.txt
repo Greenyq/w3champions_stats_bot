@@ -1,0 +1,6 @@
+requests
+python-dotenv
+playwright
+PlaywrightCapture==1.27.4
+flask
+
