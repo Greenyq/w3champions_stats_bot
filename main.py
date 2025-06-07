@@ -34,6 +34,30 @@ def load_players(filename):
     return players
 
 
+def normalize_player_id(player_id):
+    """Автоматически получает правильный BattleTag (регистр и т.п.)."""
+    try:
+        search_name = player_id.split("#")[0]  # только ник без #
+        url = f"https://website-backend.w3champions.com/api/players/search?search={urllib.parse.quote(search_name)}"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+        players = data.get("players", [])
+        for player in players:
+            if player.get("battleTag",
+                          "").endswith("#" + player_id.split("#")[1]):
+                correct_battleTag = player.get("battleTag")
+                print(f"✅ Normalized {player_id} -> {correct_battleTag}")
+                return correct_battleTag
+
+        print(f"⚠️ Could not normalize {player_id}, using as is.")
+        return player_id
+    except Exception as e:
+        print(f"⚠️ Error normalizing {player_id}: {e}")
+        return player_id
+
+
 def get_matches(player_id):
     try:
         player_id_encoded = player_id.replace("#", "%23")
@@ -78,7 +102,7 @@ def analyze_matches(matches, player_id):
         if opponent_player:
             race_map = {1: 'HU', 2: 'OR', 3: 'UD', 4: 'NE'}
             race = race_map.get(opponent_player['race'], 'UNK')
-            result_icon = "✅" if not player_team['won'] else "❌"
+            result_icon = "❌" if not player_team['won'] else "✅"
             recent_opponents.append(
                 f"- {opponent_player['battleTag']} ({race}) {result_icon}")
 
@@ -209,15 +233,19 @@ def run():
         full_message = f"🏆 <b>W3Champions Статистика игроков</b>\n📅 Сегодня: {today}\n\n"
 
         for player in players:
-            print(f"🔄 Fetching stats for {player}...")
-            matches_api = get_matches(player)
+            print(f"🔄 Normalizing {player}...")
+            normalized_player_id = normalize_player_id(player)
+
+            print(f"🔄 Fetching stats for {normalized_player_id}...")
+            matches_api = get_matches(normalized_player_id)
             win_count, lose_count, winrate, recent_opponents = analyze_matches(
-                matches_api, player)
+                matches_api, normalized_player_id)
 
-            site_matches = parse_site_matches(player)
+            site_matches = parse_site_matches(normalized_player_id)
 
-            msg = build_player_message(player, win_count, lose_count, winrate,
-                                       recent_opponents, site_matches)
+            msg = build_player_message(normalized_player_id, win_count,
+                                       lose_count, winrate, recent_opponents,
+                                       site_matches)
 
             full_message += msg
             full_message += "—" * 30 + "\n"
