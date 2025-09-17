@@ -6,12 +6,19 @@ from flask import Flask
 from playwright.sync_api import sync_playwright
 import urllib.parse
 from datetime import date, datetime
+import html
+import re
+import json
 
 # === LOAD .env ===
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL")
+
+# Discord
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_WEBHOOK_USERNAME = os.getenv("DISCORD_WEBHOOK_USERNAME", "WC3 Stats")
 
 # === SETTINGS ===
 SEASON = 22
@@ -25,9 +32,70 @@ app = Flask(__name__)
 # === GLOBALS ===
 last_posted_date = None
 
-# === FUNCTIONS ===
+
+# === UTIL ===
+def html_to_discord_md(s: str) -> str:
+    """Грубая конвертация HTML -> markdown для Discord."""
+    if not s:
+        return s
+    s = s.replace("<b>", "**").replace("</b>", "**")
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</p\s*>", "\n\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)  # убрать прочие теги
+    s = html.unescape(s)
+    return s.strip()
 
 
+def send_discord_embed(title: str,
+                       description: str,
+                       url: str | None = None,
+                       color: int = 0xF1C40F):
+    """Отправка одного embed в Discord webhook. Обрезает description до лимита."""
+    if not DISCORD_WEBHOOK_URL:
+        return 400, "DISCORD_WEBHOOK_URL is not set"
+
+    # лимит около 4096 символов
+    if len(description) > 4000:
+        description = description[:3995] + "…"
+
+    embed = {
+        "title": title or "Update",
+        "description": description or "\u200b",
+        "timestamp": datetime.utcnow().isoformat(),
+        "color": color,
+        "footer": {
+            "text": "W3Champions AutoFeed"
+        },
+    }
+    if url:
+        embed["url"] = url
+
+    payload = {
+        "username": DISCORD_WEBHOOK_USERNAME,
+        "embeds": [embed],
+    }
+
+    headers = {"Content-Type": "application/json"}
+    # простые ретраи + 429
+    for attempt in range(3):
+        r = requests.post(DISCORD_WEBHOOK_URL,
+                          headers=headers,
+                          data=json.dumps(payload),
+                          timeout=20)
+        if r.status_code in (200, 204):
+            return r.status_code, "OK"
+        if r.status_code == 429:
+            try:
+                retry_after = float(r.json().get("retry_after", 1.5))
+            except Exception:
+                retry_after = 1.5
+            time.sleep(retry_after)
+            continue
+        time.sleep(1 + attempt)
+    return r.status_code, r.text
+
+
+# === FUNCTIONS (твои) ===
 def load_players(filename):
     with open(filename, "r", encoding="utf-8") as f:
         players = [line.strip() for line in f if line.strip()]
@@ -62,11 +130,9 @@ def get_matches(player_id):
     try:
         player_id_encoded = player_id.replace("#", "%23")
         url = f"https://website-backend.w3champions.com/api/matches/search?playerId={player_id_encoded}&gateway={GATEWAY}&offset=0&pageSize={MATCHES_TO_FETCH}&season={SEASON}"
-
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
-
         return data.get('matches', [])
     except Exception as e:
         print(f"⚠️ API error for {player_id}: {e}")
@@ -108,7 +174,6 @@ def analyze_matches(matches, player_id):
 
     total = win_count + lose_count
     winrate = (win_count / total) * 100 if total > 0 else 0.0
-
     return win_count, lose_count, winrate, recent_opponents
 
 
@@ -118,18 +183,15 @@ def parse_site_matches(player_id):
     url = f"{BASE_URL}/{player_id_encoded}/matches"
 
     print(f"🌐 Fetching site matches: {url}")
-
     matches = []
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-
             page.goto(url)
             page.wait_for_selector("table.MuiTable-root tbody tr",
                                    timeout=15000)
-
             rows = page.query_selector_all("table.MuiTable-root tbody tr")
 
             for row in rows[:MATCHES_FROM_SITE]:
@@ -192,9 +254,7 @@ def build_player_message(player_id, win_count, lose_count, winrate,
 def safe_send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     MAX_LENGTH = 4000  # немного меньше 4096, с запасом
-
     parts = [text[i:i + MAX_LENGTH] for i in range(0, len(text), MAX_LENGTH)]
-
     for idx, part in enumerate(parts):
         payload = {
             "chat_id": TELEGRAM_CHANNEL,
@@ -209,8 +269,6 @@ def safe_send_to_telegram(text):
 
 
 # === Flask routes ===
-
-
 @app.route('/')
 def home():
     return "W3Champions Bot is running."
@@ -230,6 +288,7 @@ def run():
     try:
         players = load_players("players.txt")
 
+        # Заголовок для Telegram
         full_message = f"🏆 <b>W3Champions Статистика игроков</b>\n📅 Сегодня: {today}\n\n"
 
         for player in players:
@@ -240,22 +299,29 @@ def run():
             matches_api = get_matches(normalized_player_id)
             win_count, lose_count, winrate, recent_opponents = analyze_matches(
                 matches_api, normalized_player_id)
-
             site_matches = parse_site_matches(normalized_player_id)
 
+            # Текст для Telegram
             msg = build_player_message(normalized_player_id, win_count,
                                        lose_count, winrate, recent_opponents,
                                        site_matches)
+            full_message += msg + "—" * 30 + "\n"
 
-            full_message += msg
-            full_message += "—" * 30 + "\n"
+            # Embed для Discord (по одному на игрока)
+            title = f"Статистика {normalized_player_id} (Season {SEASON})"
+            desc = html_to_discord_md(msg)
+            profile_url = f"https://www.w3champions.com/player/{urllib.parse.quote(normalized_player_id)}"
+            dc_status, dc_resp = send_discord_embed(title,
+                                                    desc,
+                                                    url=profile_url)
+            print(f"Discord send: {dc_status} {dc_resp}")
+            time.sleep(1)  # лёгкая пауза между embed'ами
 
-            time.sleep(2)
-
+        # Отправка в Telegram одним батчем
         safe_send_to_telegram(full_message)
 
         last_posted_date = today
-        print("✅ Telegram post complete.")
+        print("✅ Posted to Telegram and Discord.")
         return "✅ Bot run success", 200
 
     except Exception as e:
@@ -264,6 +330,5 @@ def run():
 
 
 # === MAIN ===
-
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
