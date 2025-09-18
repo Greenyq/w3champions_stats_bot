@@ -1,31 +1,34 @@
-import requests
-import time
 import os
+import re
+import json
+import time
+import html
+import urllib.parse
+import requests
+from datetime import date, datetime
 from dotenv import load_dotenv
 from flask import Flask
 from playwright.sync_api import sync_playwright
-import urllib.parse
-from datetime import date, datetime
-import html
-import re
-import json
 
 # === LOAD .env ===
 load_dotenv()
 
+# Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL")
 
-# Discord
+# Discord (webhook)
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 DISCORD_WEBHOOK_USERNAME = os.getenv("DISCORD_WEBHOOK_USERNAME", "WC3 Stats")
+DISCORD_DISABLE = os.getenv("DISCORD_DISABLE",
+                            "0")  # "1" чтобы временно отключить постинг
 
 # === SETTINGS ===
-SEASON = 22
-GATEWAY = 20
-MATCHES_TO_FETCH = 100
-MATCHES_TO_ANALYZE = 10
-MATCHES_FROM_SITE = 5
+SEASON = int(os.getenv("SEASON", 22))
+GATEWAY = int(os.getenv("GATEWAY", 20))
+MATCHES_TO_FETCH = int(os.getenv("MATCHES_TO_FETCH", 100))
+MATCHES_TO_ANALYZE = int(os.getenv("MATCHES_TO_ANALYZE", 10))
+MATCHES_FROM_SITE = int(os.getenv("MATCHES_FROM_SITE", 5))
 
 app = Flask(__name__)
 
@@ -46,18 +49,13 @@ def html_to_discord_md(s: str) -> str:
     return s.strip()
 
 
-def send_discord_embed(title: str,
-                       description: str,
-                       url: str | None = None,
-                       color: int = 0xF1C40F):
-    """Отправка одного embed в Discord webhook. Обрезает description до лимита."""
-    if not DISCORD_WEBHOOK_URL:
-        return 400, "DISCORD_WEBHOOK_URL is not set"
-
-    # лимит около 4096 символов
-    if len(description) > 4000:
+def make_player_embed(title: str,
+                      description: str,
+                      url: str | None = None,
+                      color: int = 0xF1C40F):
+    """Сборка одного embed. Discord лимит ~4096 символов на description."""
+    if description and len(description) > 4000:
         description = description[:3995] + "…"
-
     embed = {
         "title": title or "Update",
         "description": description or "\u200b",
@@ -69,33 +67,63 @@ def send_discord_embed(title: str,
     }
     if url:
         embed["url"] = url
+    return embed
+
+
+def send_discord_embeds(embeds, username=None):
+    """Отправка порцией (до 10 embed за один POST) с экспоненциальным бэкоффом и распознаванием Cloudflare."""
+    if DISCORD_DISABLE == "1":
+        print("🔕 Discord disabled via DISCORD_DISABLE=1")
+        return 204, "Discord disabled"
+    if not DISCORD_WEBHOOK_URL:
+        return 400, "DISCORD_WEBHOOK_URL is not set"
+    if not embeds:
+        return 204, "No embeds to send"
 
     payload = {
-        "username": DISCORD_WEBHOOK_USERNAME,
-        "embeds": [embed],
+        "username": username or DISCORD_WEBHOOK_USERNAME,
+        "embeds": embeds[:10],  # максимум 10 embed в одном запросе
     }
-
     headers = {"Content-Type": "application/json"}
-    # простые ретраи + 429
-    for attempt in range(3):
+
+    backoff = 1.0
+    for attempt in range(5):  # до 5 попыток
         r = requests.post(DISCORD_WEBHOOK_URL,
                           headers=headers,
                           data=json.dumps(payload),
                           timeout=20)
         if r.status_code in (200, 204):
             return r.status_code, "OK"
+
+        body = (r.text or "")[:600].lower()
         if r.status_code == 429:
+            # уважать retry_after от Discord
             try:
-                retry_after = float(r.json().get("retry_after", 1.5))
+                retry_after = float(r.json().get("retry_after", backoff))
             except Exception:
-                retry_after = 1.5
-            time.sleep(retry_after)
+                retry_after = backoff
+            sleep_for = retry_after + 0.2 * attempt
+            print(f"⏳ Discord 429 rate limited. Sleep {sleep_for:.2f}s")
+            time.sleep(sleep_for)
             continue
-        time.sleep(1 + attempt)
-    return r.status_code, r.text
+
+        if r.status_code in (403, 503) and ("cloudflare" in body
+                                            or "access denied" in body):
+            # Cloudflare бан исходящего IP — отступаемся и пробуем с бэкоффом
+            print("⚠️ Cloudflare block detected for discord.com. Backing off…")
+
+        # экспоненциальный бэкофф + лёгкий джиттер
+        sleep_for = backoff + 0.2 * attempt
+        print(
+            f"⏳ Discord error {r.status_code}. Sleep {sleep_for:.2f}s and retry…"
+        )
+        time.sleep(sleep_for)
+        backoff = min(backoff * 2, 8.0)
+
+    return r.status_code, (r.text or "")[:600]
 
 
-# === FUNCTIONS (твои) ===
+# === DATA FUNCTIONS ===
 def load_players(filename):
     with open(filename, "r", encoding="utf-8") as f:
         players = [line.strip() for line in f if line.strip()]
@@ -107,7 +135,7 @@ def normalize_player_id(player_id):
     try:
         search_name = player_id.split("#")[0]  # только ник без #
         url = f"https://website-backend.w3champions.com/api/players/search?search={urllib.parse.quote(search_name)}"
-        response = requests.get(url)
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
         data = response.json()
 
@@ -129,8 +157,11 @@ def normalize_player_id(player_id):
 def get_matches(player_id):
     try:
         player_id_encoded = player_id.replace("#", "%23")
-        url = f"https://website-backend.w3champions.com/api/matches/search?playerId={player_id_encoded}&gateway={GATEWAY}&offset=0&pageSize={MATCHES_TO_FETCH}&season={SEASON}"
-        response = requests.get(url)
+        url = (
+            f"https://website-backend.w3champions.com/api/matches/search"
+            f"?playerId={player_id_encoded}&gateway={GATEWAY}&offset=0&pageSize={MATCHES_TO_FETCH}&season={SEASON}"
+        )
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
         data = response.json()
         return data.get('matches', [])
@@ -148,9 +179,9 @@ def analyze_matches(matches, player_id):
         player_team = None
         opponent_team = None
 
-        for team in match['teams']:
-            for player in team['players']:
-                if player['battleTag'] == player_id:
+        for team in match.get('teams', []):
+            for player in team.get('players', []):
+                if player.get('battleTag') == player_id:
                     player_team = team
                 else:
                     opponent_team = team
@@ -158,19 +189,19 @@ def analyze_matches(matches, player_id):
         if not player_team:
             continue
 
-        if player_team['won']:
+        if player_team.get('won'):
             win_count += 1
         else:
             lose_count += 1
 
         opponent_player = opponent_team['players'][
-            0] if opponent_team and opponent_team['players'] else None
+            0] if opponent_team and opponent_team.get('players') else None
         if opponent_player:
             race_map = {1: 'HU', 2: 'OR', 3: 'UD', 4: 'NE'}
-            race = race_map.get(opponent_player['race'], 'UNK')
-            result_icon = "❌" if not player_team['won'] else "✅"
+            race = race_map.get(opponent_player.get('race'), 'UNK')
+            result_icon = "❌" if not player_team.get('won') else "✅"
             recent_opponents.append(
-                f"- {opponent_player['battleTag']} ({race}) {result_icon}")
+                f"- {opponent_player.get('battleTag')} ({race}) {result_icon}")
 
     total = win_count + lose_count
     winrate = (win_count / total) * 100 if total > 0 else 0.0
@@ -205,9 +236,9 @@ def parse_site_matches(player_id):
                 result_span = cols[3].query_selector("span")
                 if result_span:
                     result_class = result_span.get_attribute("class")
-                    if "PlayerName--win" in result_class:
+                    if "PlayerName--win" in (result_class or ""):
                         result = "✅ Победа"
-                    elif "PlayerName--loss" in result_class:
+                    elif "PlayerName--loss" in (result_class or ""):
                         result = "❌ Поражение"
                     else:
                         result = "?"
@@ -261,9 +292,9 @@ def safe_send_to_telegram(text):
             "text": part,
             "parse_mode": "HTML"
         }
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=20)
         print(
-            f"➡️ Telegram response part {idx+1}/{len(parts)}: {response.status_code}, {response.text}"
+            f"➡️ Telegram response part {idx+1}/{len(parts)}: {response.status_code}, {response.text[:200]}"
         )
         time.sleep(1)
 
@@ -278,7 +309,6 @@ def home():
 def run():
     global last_posted_date
     today = date.today()
-
     print(f"=== BOT STARTED AT {datetime.now()} ===")
 
     if last_posted_date == today:
@@ -291,6 +321,9 @@ def run():
         # Заголовок для Telegram
         full_message = f"🏆 <b>W3Champions Статистика игроков</b>\n📅 Сегодня: {today}\n\n"
 
+        # Копим embeds (потом отправим партиями по 10)
+        all_embeds = []
+
         for player in players:
             print(f"🔄 Normalizing {player}...")
             normalized_player_id = normalize_player_id(player)
@@ -299,6 +332,7 @@ def run():
             matches_api = get_matches(normalized_player_id)
             win_count, lose_count, winrate, recent_opponents = analyze_matches(
                 matches_api, normalized_player_id)
+
             site_matches = parse_site_matches(normalized_player_id)
 
             # Текст для Telegram
@@ -307,18 +341,27 @@ def run():
                                        site_matches)
             full_message += msg + "—" * 30 + "\n"
 
-            # Embed для Discord (по одному на игрока)
+            # Embed для Discord
             title = f"Статистика {normalized_player_id} (Season {SEASON})"
             desc = html_to_discord_md(msg)
             profile_url = f"https://www.w3champions.com/player/{urllib.parse.quote(normalized_player_id)}"
-            dc_status, dc_resp = send_discord_embed(title,
-                                                    desc,
-                                                    url=profile_url)
-            print(f"Discord send: {dc_status} {dc_resp}")
-            time.sleep(1)  # лёгкая пауза между embed'ами
+            all_embeds.append(make_player_embed(title, desc, url=profile_url))
+
+            # Небольшая пауза, чтобы не долбить внешние API слишком часто
+            time.sleep(0.3)
+
+        # Отправляем в Discord партиями по 10 embed
+        for i in range(0, len(all_embeds), 10):
+            chunk = all_embeds[i:i + 10]
+            dc_status, dc_resp = send_discord_embeds(chunk)
+            print(f"Discord batch {i//10 + 1}: {dc_status} {dc_resp}")
+            time.sleep(1.0)
 
         # Отправка в Telegram одним батчем
-        safe_send_to_telegram(full_message)
+        if TELEGRAM_TOKEN and TELEGRAM_CHANNEL:
+            safe_send_to_telegram(full_message)
+        else:
+            print("ℹ️ Telegram disabled or not configured.")
 
         last_posted_date = today
         print("✅ Posted to Telegram and Discord.")
@@ -331,4 +374,5 @@ def run():
 
 # === MAIN ===
 if __name__ == "__main__":
+    # Для Render: PORT приходит из env
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
