@@ -430,7 +430,6 @@ def run():
         # Помечаем успех
         mark_sent_today()
         bump_cooldown()
-        global last_posted_date
         last_posted_date = today
 
         print("✅ Posted to Telegram and Discord.")
