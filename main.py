@@ -5,9 +5,9 @@ import time
 import html
 import urllib.parse
 import requests
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
-from flask import Flask
+from flask import Flask, request
 from playwright.sync_api import sync_playwright
 
 # === LOAD .env ===
@@ -20,8 +20,10 @@ TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL")
 # Discord (webhook)
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 DISCORD_WEBHOOK_USERNAME = os.getenv("DISCORD_WEBHOOK_USERNAME", "WC3 Stats")
-DISCORD_DISABLE = os.getenv("DISCORD_DISABLE",
-                            "0")  # "1" чтобы временно отключить постинг
+DISCORD_DISABLE = os.getenv("DISCORD_DISABLE", "0")  # "1" чтобы временно отключить постинг
+
+# Безопасность эндпойнта /run
+RUN_KEY = os.getenv("RUN_KEY")  # если задан, /run принимает только запрос с заголовком X-Run-Key
 
 # === SETTINGS ===
 SEASON = int(os.getenv("SEASON", 22))
@@ -30,10 +32,81 @@ MATCHES_TO_FETCH = int(os.getenv("MATCHES_TO_FETCH", 100))
 MATCHES_TO_ANALYZE = int(os.getenv("MATCHES_TO_ANALYZE", 10))
 MATCHES_FROM_SITE = int(os.getenv("MATCHES_FROM_SITE", 5))
 
+# Путь для локов и состояния (Render/Unix)
+LOCK_DIR = os.getenv("LOCK_DIR", "/tmp/w3c_bot")
+os.makedirs(LOCK_DIR, exist_ok=True)
+DAILY_LOCK_FILE = os.path.join(LOCK_DIR, "daily_lock.json")
+RUN_LOCK_FILE = os.path.join(LOCK_DIR, "run.lock")
+
+# (опц.) дополнительная защита: минимальный интервал между запусками
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", 0))
+COOLDOWN_FILE = os.path.join(LOCK_DIR, "cooldown.json")
+
 app = Flask(__name__)
 
-# === GLOBALS ===
+# === GLOBALS (in-memory; оставляем как дополнительную страховку) ===
 last_posted_date = None
+
+
+# === LOCKS / IDEMPOTENCY ===
+def already_sent_today() -> bool:
+    try:
+        with open(DAILY_LOCK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("date") == date.today().isoformat()
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        print(f"⚠️ read daily lock error: {e}")
+        return False
+
+
+def mark_sent_today():
+    tmp = DAILY_LOCK_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"date": date.today().isoformat()}, f)
+    os.replace(tmp, DAILY_LOCK_FILE)
+
+
+def acquire_run_lock() -> bool:
+    try:
+        fd = os.open(RUN_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_run_lock():
+    try:
+        os.remove(RUN_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def cooldown_active() -> bool:
+    if COOLDOWN_MINUTES <= 0:
+        return False
+    try:
+        with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ts = float(data.get("ts", 0))
+        until = datetime.fromtimestamp(ts) + timedelta(minutes=COOLDOWN_MINUTES)
+        return datetime.utcnow() < until
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        print(f"⚠️ cooldown read error: {e}")
+        return False
+
+
+def bump_cooldown():
+    if COOLDOWN_MINUTES <= 0:
+        return
+    tmp = COOLDOWN_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"ts": datetime.utcnow().timestamp()}, f)
+    os.replace(tmp, COOLDOWN_FILE)
 
 
 # === UTIL ===
@@ -49,10 +122,7 @@ def html_to_discord_md(s: str) -> str:
     return s.strip()
 
 
-def make_player_embed(title: str,
-                      description: str,
-                      url: str | None = None,
-                      color: int = 0xF1C40F):
+def make_player_embed(title: str, description: str, url: str | None = None, color: int = 0xF1C40F):
     """Сборка одного embed. Discord лимит ~4096 символов на description."""
     if description and len(description) > 4000:
         description = description[:3995] + "…"
@@ -61,9 +131,7 @@ def make_player_embed(title: str,
         "description": description or "\u200b",
         "timestamp": datetime.utcnow().isoformat(),
         "color": color,
-        "footer": {
-            "text": "W3Champions AutoFeed"
-        },
+        "footer": {"text": "W3Champions AutoFeed"},
     }
     if url:
         embed["url"] = url
@@ -80,18 +148,12 @@ def send_discord_embeds(embeds, username=None):
     if not embeds:
         return 204, "No embeds to send"
 
-    payload = {
-        "username": username or DISCORD_WEBHOOK_USERNAME,
-        "embeds": embeds[:10],  # максимум 10 embed в одном запросе
-    }
+    payload = {"username": username or DISCORD_WEBHOOK_USERNAME, "embeds": embeds[:10]}
     headers = {"Content-Type": "application/json"}
 
     backoff = 1.0
     for attempt in range(5):  # до 5 попыток
-        r = requests.post(DISCORD_WEBHOOK_URL,
-                          headers=headers,
-                          data=json.dumps(payload),
-                          timeout=20)
+        r = requests.post(DISCORD_WEBHOOK_URL, headers=headers, data=json.dumps(payload), timeout=20)
         if r.status_code in (200, 204):
             return r.status_code, "OK"
 
@@ -107,16 +169,12 @@ def send_discord_embeds(embeds, username=None):
             time.sleep(sleep_for)
             continue
 
-        if r.status_code in (403, 503) and ("cloudflare" in body
-                                            or "access denied" in body):
-            # Cloudflare бан исходящего IP — отступаемся и пробуем с бэкоффом
+        if r.status_code in (403, 503) and ("cloudflare" in body or "access denied" in body):
             print("⚠️ Cloudflare block detected for discord.com. Backing off…")
 
         # экспоненциальный бэкофф + лёгкий джиттер
         sleep_for = backoff + 0.2 * attempt
-        print(
-            f"⏳ Discord error {r.status_code}. Sleep {sleep_for:.2f}s and retry…"
-        )
+        print(f"⏳ Discord error {r.status_code}. Sleep {sleep_for:.2f}s and retry…")
         time.sleep(sleep_for)
         backoff = min(backoff * 2, 8.0)
 
@@ -141,8 +199,7 @@ def normalize_player_id(player_id):
 
         players = data.get("players", [])
         for player in players:
-            if player.get("battleTag",
-                          "").endswith("#" + player_id.split("#")[1]):
+            if player.get("battleTag", "").endswith("#" + player_id.split("#")[1]):
                 correct_battleTag = player.get("battleTag")
                 print(f"✅ Normalized {player_id} -> {correct_battleTag}")
                 return correct_battleTag
@@ -180,8 +237,8 @@ def analyze_matches(matches, player_id):
         opponent_team = None
 
         for team in match.get('teams', []):
-            for player in team.get('players', []):
-                if player.get('battleTag') == player_id:
+            for pl in team.get('players', []):
+                if pl.get('battleTag') == player_id:
                     player_team = team
                 else:
                     opponent_team = team
@@ -194,14 +251,12 @@ def analyze_matches(matches, player_id):
         else:
             lose_count += 1
 
-        opponent_player = opponent_team['players'][
-            0] if opponent_team and opponent_team.get('players') else None
+        opponent_player = opponent_team['players'][0] if opponent_team and opponent_team.get('players') else None
         if opponent_player:
             race_map = {1: 'HU', 2: 'OR', 3: 'UD', 4: 'NE'}
             race = race_map.get(opponent_player.get('race'), 'UNK')
             result_icon = "❌" if not player_team.get('won') else "✅"
-            recent_opponents.append(
-                f"- {opponent_player.get('battleTag')} ({race}) {result_icon}")
+            recent_opponents.append(f"- {opponent_player.get('battleTag')} ({race}) {result_icon}")
 
     total = win_count + lose_count
     winrate = (win_count / total) * 100 if total > 0 else 0.0
@@ -221,8 +276,7 @@ def parse_site_matches(player_id):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url)
-            page.wait_for_selector("table.MuiTable-root tbody tr",
-                                   timeout=15000)
+            page.wait_for_selector("table.MuiTable-root tbody tr", timeout=15000)
             rows = page.query_selector_all("table.MuiTable-root tbody tr")
 
             for row in rows[:MATCHES_FROM_SITE]:
@@ -259,8 +313,7 @@ def parse_site_matches(player_id):
     return matches
 
 
-def build_player_message(player_id, win_count, lose_count, winrate,
-                         recent_opponents, site_matches):
+def build_player_message(player_id, win_count, lose_count, winrate, recent_opponents, site_matches):
     msg = f"📊 <b>Статистика {player_id} (Season {SEASON})</b>\n"
     msg += f"✅ Побед: {win_count}\n"
     msg += f"❌ Поражений: {lose_count}\n"
@@ -287,15 +340,9 @@ def safe_send_to_telegram(text):
     MAX_LENGTH = 4000  # немного меньше 4096, с запасом
     parts = [text[i:i + MAX_LENGTH] for i in range(0, len(text), MAX_LENGTH)]
     for idx, part in enumerate(parts):
-        payload = {
-            "chat_id": TELEGRAM_CHANNEL,
-            "text": part,
-            "parse_mode": "HTML"
-        }
+        payload = {"chat_id": TELEGRAM_CHANNEL, "text": part, "parse_mode": "HTML"}
         response = requests.post(url, json=payload, timeout=20)
-        print(
-            f"➡️ Telegram response part {idx+1}/{len(parts)}: {response.status_code}, {response.text[:200]}"
-        )
+        print(f"➡️ Telegram response part {idx+1}/{len(parts)}: {response.status_code}, {response.text[:200]}")
         time.sleep(1)
 
 
@@ -305,23 +352,45 @@ def home():
     return "W3Champions Bot is running."
 
 
-@app.route('/run')
+@app.route('/run', methods=['POST', 'GET'])
 def run():
+    # (опц.) защита ключом
+    if RUN_KEY:
+        key = request.headers.get("X-Run-Key")
+        if key != RUN_KEY:
+            return "Forbidden", 403
+
     global last_posted_date
     today = date.today()
     print(f"=== BOT STARTED AT {datetime.now()} ===")
 
-    if last_posted_date == today:
-        print("⏱ Already sent today.")
+    # Жёсткая дневная защёлка (persist)
+    if already_sent_today():
+        print("⏱ Already sent today (file lock).")
         return '⏱ Already sent today', 200
 
+    # Минимальный интервал (если настроен)
+    if cooldown_active():
+        print("⏱ Cooldown active, skipping.")
+        return '⏱ Cooldown active', 200
+
+    # Блокируем параллельные вызовы
+    if not acquire_run_lock():
+        print("⏱ Another run in progress (run-lock).")
+        return '⏱ Another run in progress', 200
+
     try:
+        # Доп. in-memory защита
+        if last_posted_date == today:
+            print("⏱ Already sent today (memory).")
+            return '⏱ Already sent today', 200
+
         players = load_players("players.txt")
 
         # Заголовок для Telegram
         full_message = f"🏆 <b>W3Champions Статистика игроков</b>\n📅 Сегодня: {today}\n\n"
 
-        # Копим embeds (потом отправим партиями по 10)
+        # Копим embeds для Discord
         all_embeds = []
 
         for player in players:
@@ -330,15 +399,11 @@ def run():
 
             print(f"🔄 Fetching stats for {normalized_player_id}...")
             matches_api = get_matches(normalized_player_id)
-            win_count, lose_count, winrate, recent_opponents = analyze_matches(
-                matches_api, normalized_player_id)
-
+            win_count, lose_count, winrate, recent_opponents = analyze_matches(matches_api, normalized_player_id)
             site_matches = parse_site_matches(normalized_player_id)
 
             # Текст для Telegram
-            msg = build_player_message(normalized_player_id, win_count,
-                                       lose_count, winrate, recent_opponents,
-                                       site_matches)
+            msg = build_player_message(normalized_player_id, win_count, lose_count, winrate, recent_opponents, site_matches)
             full_message += msg + "—" * 30 + "\n"
 
             # Embed для Discord
@@ -347,12 +412,11 @@ def run():
             profile_url = f"https://www.w3champions.com/player/{urllib.parse.quote(normalized_player_id)}"
             all_embeds.append(make_player_embed(title, desc, url=profile_url))
 
-            # Небольшая пауза, чтобы не долбить внешние API слишком часто
-            time.sleep(0.3)
+            time.sleep(0.3)  # не долбим внешние API слишком часто
 
         # Отправляем в Discord партиями по 10 embed
         for i in range(0, len(all_embeds), 10):
-            chunk = all_embeds[i:i + 10]
+            chunk = all_embeds[i:i+10]
             dc_status, dc_resp = send_discord_embeds(chunk)
             print(f"Discord batch {i//10 + 1}: {dc_status} {dc_resp}")
             time.sleep(1.0)
@@ -363,13 +427,20 @@ def run():
         else:
             print("ℹ️ Telegram disabled or not configured.")
 
+        # Помечаем успех
+        mark_sent_today()
+        bump_cooldown()
+        global last_posted_date
         last_posted_date = today
+
         print("✅ Posted to Telegram and Discord.")
         return "✅ Bot run success", 200
 
     except Exception as e:
         print(f"❌ Error in /run: {e}")
         return f"❌ Error in /run: {e}", 500
+    finally:
+        release_run_lock()
 
 
 # === MAIN ===
